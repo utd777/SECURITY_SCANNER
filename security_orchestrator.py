@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Security Orchestrator - Cross-Platform GUI for Nmap, Searchsploit, Nikto, enum4linux, and w3af
+Security Orchestrator - Cross-Platform GUI for Nmap, Searchsploit, Wapiti, enum4linux, and Metasploit
 A comprehensive reconnaissance and vulnerability analysis tool.
 
 This is a single-file implementation combining all components for easy deployment on Kali Linux.
@@ -18,12 +18,26 @@ import queue
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Tuple, Any, Callable, Iterable
+import traceback
 import logging
 import logging.handlers
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import json
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image, Preformatted
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+
+
+# Import automated SQLMap scanner
+from automated_sqlmap_capture import IntegratedSQLMapScanner
+
+# Import pentest automation integration (bitvijays/Pentest-Scripts inspired)
+from pentest_automation_integration import AutomatedEnumerator, ExternalEnumerator
 
 # =============================================================================
 # CONFIGURATION AND UTILITIES
@@ -44,10 +58,10 @@ class Config:
                 'version': '1.0.0',
                 'window_width': 1200,
                 'window_height': 800,
-                'window_title': 'Security Orchestrator - Nmap, Searchsploit, Nikto, enum4linux & w3af Integration'
+                'window_title': 'Security Orchestrator - Nmap, Searchsploit, Wapiti, Enum4linux & Metasploit'
             },
             'paths': {
-                'results_dir': 'results',
+                'results_dir': 'Desktop',
                 'log_file': 'scan.log',
                 'temp_dir': 'temp'
             },
@@ -62,25 +76,39 @@ class Config:
                     'timeout': 60,
                     'default_args': []
                 },
-                'nikto': {
-                    'executable': self._get_tool_executable('nikto'),
-                    'timeout': 600,
-                    'default_args': ['-Format', 'xml']
-                },
                 'enum4linux': {
                     'executable': self._get_tool_executable('enum4linux'),
                     'timeout': 300,
                     'default_args': ['-a']
                 },
-                'w3af_console': {
-                    'executable': self._get_tool_executable('w3af_console'),
-                    'timeout': 600,
-                    'script_timeout': 300,
+                'wapiti': {
+                    'executable': self._get_tool_executable('wapiti'),
+                    'timeout': 1200,  # 20 minutes
                     'default_args': []
                 },
                 'msfconsole': {
                     'executable': self._get_tool_executable('msfconsole'),
                     'timeout': 300,
+                    'default_args': []
+                },
+                'hydra': {
+                    'executable': self._get_tool_executable('hydra'),
+                    'timeout': 600,
+                    'default_args': []
+                },
+                'sqlmap': {
+                    'executable': self._get_tool_executable('sqlmap'),
+                    'timeout': 900,
+                    'default_args': []
+                },
+                'gobuster': {
+                    'executable': self._get_tool_executable('gobuster'),
+                    'timeout': 600,
+                    'default_args': []
+                },
+                'nuclei': {
+                    'executable': '/usr/local/bin/nuclei',
+                    'timeout': 1800,
                     'default_args': []
                 }
             },
@@ -196,9 +224,28 @@ class Config:
         if base_dir:
             results_path = Path(base_dir) / self.get('paths.results_dir')
         else:
-            results_path = Path.cwd() / self.get('paths.results_dir')
+            # Use absolute path - try to get user's home directory first
+            # or fallback to /tmp if running as root
+            import os
+            if 'SUDO_USER' in os.environ:
+                # Running with sudo, use the actual user's home
+                user_home = Path(f"/home/{os.environ['SUDO_USER']}")
+            elif os.getenv('USER') == 'root':
+                # Running as root without sudo, use /tmp
+                user_home = Path('/tmp')
+            else:
+                # Normal user, use home directory
+                user_home = Path.home()
+
+            results_path = user_home / self.get('paths.results_dir')
 
         results_path.mkdir(parents=True, exist_ok=True)
+        # Ensure proper permissions if created as root
+        try:
+            import stat
+            results_path.chmod(stat.S_IRWXU | stat.S_IRWXG | stat.S_IROTH | stat.S_IXOTH)  # 775
+        except:
+            pass
         return results_path
 
     def get_log_file_path(self, results_dir: Optional[Path] = None) -> Path:
@@ -394,6 +441,7 @@ class ScanResults:
         self.nikto_results = {}
         self.enum4linux_results = {}
         self.w3af_results = {}
+        self.wapiti_results = {}
         self.metadata = {
             'scan_start_time': None,
             'scan_end_time': None,
@@ -422,6 +470,8 @@ class ScanResults:
             self.enum4linux_results = result
         elif tool_name == 'w3af':
             self.w3af_results = result
+        elif tool_name == 'wapiti':
+            self.wapiti_results = result
 
     def get_tool_result(self, tool_name: str) -> Dict[str, Any]:
         """Get results from a specific tool."""
@@ -435,6 +485,8 @@ class ScanResults:
             return self.enum4linux_results
         elif tool_name == 'w3af':
             return self.w3af_results
+        elif tool_name == 'wapiti':
+            return self.wapiti_results
         return {}
 
     def to_dict(self) -> Dict[str, Any]:
@@ -445,7 +497,8 @@ class ScanResults:
             'searchsploit_results': self.searchsploit_results,
             'nikto_results': self.nikto_results,
             'enum4linux_results': self.enum4linux_results,
-            'w3af_results': self.w3af_results
+            'w3af_results': self.w3af_results,
+            'wapiti_results': self.wapiti_results
         }
 
 class AttackPath:
@@ -500,7 +553,7 @@ class NmapWrapper:
 
     def __init__(self, results_dir: Optional[Path] = None):
         self.results_dir = results_dir or config.get_results_dir()
-        self.xml_output_file = self.results_dir / "nmap_result.xml"
+        self.xml_output_file = self.results_dir / f"nmap_result_{getattr(self, "target_ip", "unknown")}.xml"
         self.timeout = config.get('tools.nmap.timeout', 300)
 
     def check_availability(self) -> bool:
@@ -597,7 +650,13 @@ class NmapWrapper:
 
             command = self.parse_nmap_command(nmap_command, target_ip)
 
+            # Ensure results directory exists with proper permissions
             self.results_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                import stat
+                self.results_dir.chmod(stat.S_IRWXU | stat.S_IRWXG | stat.S_IROTH | stat.S_IXOTH)
+            except:
+                pass
 
             logger.log_command_execution(command, str(self.results_dir))
 
@@ -617,6 +676,19 @@ class NmapWrapper:
                 logger.log_tool_output('nmap', stderr, True)
 
             if process.returncode == 0 and self.xml_output_file.exists():
+                # Fix file permissions if created by sudo
+                try:
+                    import os
+                    if os.geteuid() == 0 and 'SUDO_USER' in os.environ:
+                        # Change ownership back to the real user
+                        import pwd
+                        real_user = os.environ['SUDO_USER']
+                        uid = pwd.getpwnam(real_user).pw_uid
+                        gid = pwd.getpwnam(real_user).pw_gid
+                        os.chown(self.xml_output_file, uid, gid)
+                except:
+                    pass
+
                 logger.end_tool_step('nmap', True, f"XML output saved to {self.xml_output_file}")
                 return True, f"Nmap scan completed successfully. XML output: {self.xml_output_file}"
             else:
@@ -859,7 +931,7 @@ class SearchsploitWrapper:
 
     def __init__(self, results_dir: Optional[Path] = None):
         self.results_dir = results_dir or config.get_results_dir()
-        self.output_file = self.results_dir / "searchsploit.txt"
+        self.output_file = self.results_dir / f"searchsploit_{getattr(self, "target_ip", "unknown")}.txt"
         self.timeout = config.get('tools.searchsploit.timeout', 60)
 
     def check_availability(self) -> bool:
@@ -870,7 +942,8 @@ class SearchsploitWrapper:
                                     capture_output=True,
                                     timeout=10,
                                     text=True)
-            available = result.returncode == 0
+            # searchsploit returns exit code 2 for --help, but it's still available
+            available = result.returncode in [0, 2] or 'searchsploit' in result.stdout.lower() or 'options' in result.stdout.lower()
             logger.log_tool_availability('searchsploit', available, executable if available else None)
             return available
         except Exception as e:
@@ -889,7 +962,7 @@ class SearchsploitWrapper:
                 return False, error_msg
 
             executable = config.get('tools.searchsploit.executable')
-            command = [executable, '--nmap', str(nmap_xml_file), '-x']
+            command = [executable, '-v', '--nmap', str(nmap_xml_file)]
 
             self.results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -945,64 +1018,131 @@ class SearchsploitWrapper:
         if output is None:
             if not self.output_file.exists():
                 logger.error(f"Searchsploit output file not found: {self.output_file}")
-                return {'exploits': [], 'summary': {}}
+                return {'exploits': [], 'summary': {}, 'vulnerabilities': []}
 
             try:
                 with open(self.output_file, 'r', encoding='utf-8') as f:
                     output = f.read()
             except Exception as e:
                 logger.error(f"Error reading searchsploit output: {e}")
-                return {'exploits': [], 'summary': {}}
+                return {'exploits': [], 'summary': {}, 'vulnerabilities': []}
 
         results = {
             'exploits': [],
+            'vulnerabilities': [],
             'summary': {
                 'total_found': 0,
                 'by_service': {},
-                'by_platform': {}
+                'by_platform': {},
+                'by_type': {}
             }
         }
 
         try:
             lines = output.split('\n')
+            current_service = None
+            in_exploit_section = False
 
-            for line in lines:
+            for i, line in enumerate(lines):
+                original_line = line
                 line = line.strip()
+
+                # Skip empty lines
                 if not line:
                     continue
 
-                match = re.match(r'(\d+)\s+\|\s+([^|]+?)\s+\|\s+([^|]+?)\s+\|\s+(.+)', line)
-                if match:
-                    exploit_id = match.group(1).strip()
-                    title = match.group(2).strip()
-                    platform = match.group(3).strip()
-                    path = match.group(4).strip()
+                # Detect service being searched (lines starting with [i] /usr/bin/searchsploit)
+                if '/usr/bin/searchsploit -t ' in line:
+                    # Extract service name from command
+                    match = re.search(r'-t\s+(.+?)(?:\s|$)', line)
+                    if match:
+                        current_service = match.group(1).strip()
+                    in_exploit_section = True
+                    continue
 
-                    exploit_info = {
-                        'id': exploit_id,
-                        'title': title,
-                        'platform': platform,
-                        'path': path,
-                        'local_file': self._find_local_file(path)
-                    }
+                # Skip info/warning/error lines
+                if line.startswith('[i]') or line.startswith('[-]') or line.startswith('[+]'):
+                    continue
 
-                    results['exploits'].append(exploit_info)
+                # Skip separator lines
+                if '---' in line or '===' in line:
+                    continue
 
-                    results['summary']['total_found'] += 1
+                # Skip header lines
+                if 'Exploit Title' in line or 'Shellcode Title' in line or 'Path' in line:
+                    continue
 
-                    if platform in results['summary']['by_platform']:
+                # Parse exploit lines (format: "Exploit Title | Path")
+                if '|' in line and len(line) > 20:
+                    parts = line.split('|')
+                    if len(parts) >= 2:
+                        title = parts[0].strip()
+                        path = parts[1].strip()
+
+                        # Ignore lines that are not proper exploits
+                        if not title or not path or title == 'Exploit Title' or '---' in title:
+                            continue
+
+                        # Determine platform from path
+                        platform = 'unknown'
+                        if '/' in path:
+                            platform = path.split('/')[0]
+
+                        # Determine type (exploit vs shellcode vs other)
+                        exploit_type = 'exploit'
+                        if 'shellcode' in current_service or i > 0 and 'Shellcode' in lines[i-1]:
+                            exploit_type = 'shellcode'
+
+                        exploit_info = {
+                            'id': f"{platform}_{results['summary']['total_found']}",
+                            'title': title,
+                            'platform': platform,
+                            'service': current_service or 'unknown',
+                            'type': exploit_type,
+                            'path': path,
+                            'local_file': self._find_local_file(path),
+                            'severity': self._estimate_severity(title)
+                        }
+
+                        results['exploits'].append(exploit_info)
+                        results['vulnerabilities'].append({
+                            'type': 'known_exploit',
+                            'title': title,
+                            'service': current_service or 'unknown',
+                            'platform': platform,
+                            'severity': exploit_info['severity'],
+                            'source': 'searchsploit',
+                            'description': f"Potential {platform.title()} exploit available: {title}",
+                            'path': path
+                        })
+
+                        results['summary']['total_found'] += 1
+
+                        # Track by service
+                        if current_service:
+                            if current_service not in results['summary']['by_service']:
+                                results['summary']['by_service'][current_service] = 0
+                            results['summary']['by_service'][current_service] += 1
+
+                        # Track by platform
+                        if platform not in results['summary']['by_platform']:
+                            results['summary']['by_platform'][platform] = 0
                         results['summary']['by_platform'][platform] += 1
-                    else:
-                        results['summary']['by_platform'][platform] = 1
 
-            self._extract_service_mappings(output, results)
+                        # Track by type
+                        if exploit_type not in results['summary']['by_type']:
+                            results['summary']['by_type'][exploit_type] = 0
+                        results['summary']['by_type'][exploit_type] += 1
 
             logger.debug(f"Parsed {len(results['exploits'])} exploits from searchsploit output")
+            logger.debug(f"Found {len(results['vulnerabilities'])} vulnerabilities")
             return results
 
         except Exception as e:
             logger.error(f"Error parsing searchsploit results: {e}")
-            return {'exploits': [], 'summary': {}}
+            logger.debug(f"Exception traceback: {traceback.format_exc()}")
+            return {'exploits': [], 'vulnerabilities': [], 'summary': {}}
+
 
     def _find_local_file(self, path: str) -> Optional[str]:
         """Try to find the local exploit file path."""
@@ -1022,6 +1162,28 @@ class SearchsploitWrapper:
             return None
         except Exception:
             return None
+
+
+    def _estimate_severity(self, title: str) -> str:
+        """Estimate exploit severity based on title keywords."""
+        title_lower = title.lower()
+
+        # Critical keywords
+        if any(keyword in title_lower for keyword in ['buffer overflow', 'remote code execution', 'rce', 'privilege escalation',
+                                                        'arbitrary code', 'command execution', 'shell', 'backdoor', 'authentication bypass']):
+            return 'critical'
+
+        # High severity
+        if any(keyword in title_lower for keyword in ['sql injection', 'xss', 'cross-site', 'file inclusion', 'lfi', 'rfi',
+                                                        'denial of service', 'dos', 'crash']):
+            return 'high'
+
+        # Medium severity
+        if any(keyword in title_lower for keyword in ['weak password', 'disclosure', 'bypass', 'enumeration', 'information']):
+            return 'medium'
+
+        # Default to low
+        return 'low'
 
     def _extract_service_mappings(self, output: str, results: Dict[str, Any]) -> None:
         """Extract service-to-exploit mappings from output."""
@@ -1113,10 +1275,12 @@ class NiktoWrapper:
                 executable,
                 '-h', url,
                 '-Format', 'xml',
-                '-output', str(xml_output_file)
+                '-output', str(xml_output_file),
+                '-Tuning', 'x',  # Skip time-intensive checks
+                '-maxtime', '10m'  # Max 10 minutes per host
             ]
 
-            logger.debug(f"Scanning {url} with Nikto")
+            logger.debug(f"Scanning {url} with Nikto (quick mode)")
             logger.log_command_execution(command, str(self.results_dir))
 
             process = subprocess.Popen(
@@ -1361,7 +1525,7 @@ class MetasploitWrapper:
 
     def __init__(self, results_dir: Optional[Path] = None):
         self.results_dir = results_dir or config.get_results_dir()
-        self.output_file = self.results_dir / "metasploit_suggestions.txt"
+        self.output_file = self.results_dir / f"metasploit_suggestions_{getattr(self, "target_ip", "unknown")}.txt"
         self.timeout = config.get('tools.msfconsole.timeout', 300)
 
     def check_availability(self) -> bool:
@@ -1372,7 +1536,8 @@ class MetasploitWrapper:
                                     capture_output=True,
                                     timeout=10,
                                     text=True)
-            available = 'Framework' in result.stdout or 'Metasploit' in result.stdout
+            output = result.stdout + result.stderr
+            available = 'Framework' in output or 'Metasploit' in output or 'metasploit' in output
             logger.log_tool_availability('msfconsole', available, executable if available else None)
             return available
         except Exception as e:
@@ -1649,7 +1814,7 @@ class Enum4LinuxWrapper:
 
     def __init__(self, results_dir: Optional[Path] = None):
         self.results_dir = results_dir or config.get_results_dir()
-        self.output_file = self.results_dir / "enum4linux.txt"
+        self.output_file = self.results_dir / f"enum4linux_{getattr(self, "target_ip", "unknown")}.txt"
         self.timeout = config.get('tools.enum4linux.timeout', 300)
         self.raw_output = ""
 
@@ -1661,7 +1826,8 @@ class Enum4LinuxWrapper:
                                     capture_output=True,
                                     timeout=10,
                                     text=True)
-            available = 'enum4linux' in result.stderr.lower() or 'usage' in result.stderr.lower()
+            output = (result.stdout + result.stderr).lower()
+            available = 'enum4linux' in output or 'usage' in output
             logger.log_tool_availability('enum4linux', available, executable if available else None)
             return available
         except Exception as e:
@@ -2145,6 +2311,396 @@ class W3afWrapper:
             return results
 
 # =============================================================================
+# WAPITI WRAPPER
+# =============================================================================
+
+class WapitiWrapper:
+    """Wapiti wrapper for web application vulnerability scanning."""
+
+    def __init__(self, results_dir: Optional[Path] = None):
+        self.results_dir = results_dir or config.get_results_dir()
+        self.output_file = self.results_dir / f"wapiti_report_{getattr(self, "target_ip", "unknown")}.json"
+        self.timeout = config.get('tools.wapiti.timeout', 600)
+        self.individual_output_files: List[Path] = []
+
+    def check_availability(self) -> bool:
+        """Check if wapiti is available on the system."""
+        try:
+            executable = config.get('tools.wapiti.executable')
+            result = subprocess.run([executable, '--version'],
+                                    capture_output=True,
+                                    timeout=10,
+                                    text=True)
+            available = result.returncode == 0
+            logger.log_tool_availability('wapiti', available, executable if available else None)
+            return available
+        except Exception as e:
+            logger.log_tool_availability('wapiti', False)
+            logger.debug(f"wapiti availability check failed: {e}")
+            return False
+
+    def run_scan(self, http_ports: List[Dict[str, Any]]) -> Tuple[bool, str]:
+        """Run wapiti scan against discovered HTTP services."""
+        if not http_ports:
+            logger.info("No HTTP/HTTPS ports found for wapiti scanning")
+            return True, "No HTTP/HTTPS services to scan"
+
+        logger.start_tool_step('wapiti', f'Scanning {len(http_ports)} HTTP/HTTPS services')
+
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        all_results: List[Path] = []
+        self.individual_output_files = []
+
+        for http_service in http_ports:
+            url = http_service['url']
+            logger.info(f"Scanning {url} with Wapiti...")
+
+            # Create output file for this URL
+            url_safe = url.replace('://', '_').replace('/', '_').replace(':', '_')
+            url_output = self.results_dir / f"wapiti_{url_safe}.json"
+
+            executable = config.get('tools.wapiti.executable')
+            command = [
+                executable,
+                '-u', url,
+                '-f', 'json',
+                '-o', str(url_output),
+                '--flush-session',
+                '--scope', 'folder',  # Scan folder instead of just URL
+                '-m', 'xss,sql,file,exec',  # Focus on critical vulns
+                '--max-scan-time', '600',  # Max 10 minutes (in seconds)
+                '-d', '2',  # Limit crawl depth to 2
+                '--max-links-per-page', '20'  # Limit links per page
+            ]
+
+            logger.log_command_execution(command, str(self.results_dir))
+
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    cwd=str(self.results_dir)
+                )
+
+                if result.stdout.strip():
+                    logger.log_tool_output('wapiti', result.stdout, False)
+                if result.stderr.strip():
+                    logger.log_tool_output('wapiti', result.stderr, True)
+
+                if url_output.exists():
+                    all_results.append(url_output)
+                    self.individual_output_files.append(url_output)
+                    logger.info(f"Wapiti scan completed for {url}")
+                else:
+                    logger.warning(f"Wapiti scan for {url} produced no output file")
+
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Wapiti scan for {url} timed out after {self.timeout} seconds")
+            except Exception as e:
+                logger.error(f"Wapiti scan error for {url}: {str(e)}")
+
+        if all_results:
+            # Merge all results into one file
+            merged_results = {
+                'scans': [],
+                'total_vulnerabilities': 0,
+                'urls_scanned': len(http_ports)
+            }
+
+            for result_file in all_results:
+                try:
+                    with open(result_file, 'r') as f:
+                        scan_data = json.load(f)
+                        merged_results['scans'].append(scan_data)
+                        if 'vulnerabilities' in scan_data:
+                            merged_results['total_vulnerabilities'] += len(scan_data.get('vulnerabilities', []))
+                except Exception as e:
+                    logger.error(f"Error reading {result_file}: {e}")
+
+            # Save merged results
+            with open(self.output_file, 'w') as f:
+                json.dump(merged_results, f, indent=2)
+
+            logger.end_tool_step('wapiti', True, f"Scanned {len(http_ports)} URLs, found {merged_results['total_vulnerabilities']} vulnerabilities")
+            return True, f"Wapiti scan completed. Results: {self.output_file}"
+        else:
+            logger.end_tool_step('wapiti', False, "No results generated")
+            return False, "Wapiti scan completed with no results"
+
+    def parse_results(self) -> Dict[str, Any]:
+        """Parse wapiti JSON output and extract findings."""
+        results = {
+            'vulnerabilities': [],
+            'scan_summary': {},
+            'urls_scanned': []
+        }
+
+        if not self.output_file.exists():
+            logger.warning(f"Wapiti output file not found: {self.output_file}")
+            return results
+
+        try:
+            with open(self.output_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            results['scan_summary'] = {
+                'urls_scanned': data.get('urls_scanned', 0),
+                'total_vulnerabilities': data.get('total_vulnerabilities', 0)
+            }
+
+            # Parse vulnerabilities from all scans
+            for scan in data.get('scans', []):
+                if 'vulnerabilities' in scan:
+                    for category, vulns in scan['vulnerabilities'].items():
+                        for vuln in vulns:
+                            severity = self._map_severity(vuln.get('level', 1))
+                            results['vulnerabilities'].append({
+                                'type': category,
+                                'severity': severity,
+                                'method': vuln.get('method', 'GET'),
+                                'path': vuln.get('path', ''),
+                                'parameter': vuln.get('parameter', ''),
+                                'description': vuln.get('info', ''),
+                                'curl_command': vuln.get('curl_command', '')
+                            })
+
+            logger.debug(f"Parsed {len(results['vulnerabilities'])} wapiti vulnerabilities")
+            return results
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing wapiti JSON: {e}")
+            return results
+        except Exception as e:
+            logger.error(f"Error parsing wapiti results: {e}")
+            return results
+
+    def _map_severity(self, level: int) -> str:
+        """Map wapiti severity level to severity string."""
+        severity_map = {
+            1: 'low',
+            2: 'medium',
+            3: 'high'
+        }
+        return severity_map.get(level, 'medium')
+
+
+# =============================================================================
+# NUCLEI WRAPPER - Template-Based Vulnerability Scanner
+# =============================================================================
+
+class NucleiWrapper:
+    """Nuclei wrapper for comprehensive vulnerability scanning using YAML templates."""
+
+    def __init__(self, results_dir: Optional[Path] = None):
+        self.results_dir = results_dir or config.get_results_dir()
+        self.timeout = config.get('tools.nuclei.timeout', 1800)  # 30abnnnnnnnnnnnnnnnnnnnnnnnnnnnnno minutes default
+        self.last_output_dir: Optional[Path] = None
+        self.last_json_output: Optional[Path] = None
+        self.last_markdown_output: Optional[Path] = None
+        self.last_sarif_output: Optional[Path] = None
+
+    def check_availability(self) -> bool:
+        """Check if Nuclei is available."""
+        executable = config.get('tools.nuclei.executable', 'nuclei')
+
+        try:
+            result = subprocess.run([executable, '-version'],
+                                  capture_output=True,
+                                  timeout=5,
+                                  text=True)
+            available = result.returncode == 0
+            logger.log_tool_availability('nuclei', available, executable if available else None)
+            if available and result.stdout:
+                logger.debug(f"Nuclei version: {result.stdout.strip()}")
+            return available
+        except Exception as e:
+            logger.log_tool_availability('nuclei', False)
+            logger.debug(f"Nuclei availability check failed: {e}")
+            return False
+
+    def scan_targets(self, urls: List[str], severity: str = "critical,high,medium") -> Tuple[bool, str]:
+        """
+        Scan URLs with Nuclei templates.
+
+        Args:
+            urls: List of URLs to scan
+            severity: Comma-separated severity levels (critical,high,medium,low,info)
+
+        Returns:
+            Tuple of (success, message)
+        """
+        if not urls:
+            logger.info("No URLs to scan with Nuclei")
+            return True, "No web services to scan"
+
+        logger.start_tool_step('nuclei', f'Scanning {len(urls)} URLs with Nuclei templates')
+
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = self.results_dir / "nuclei"
+        output_dir.mkdir(exist_ok=True)
+        self.last_output_dir = output_dir
+
+        # Create URL list file
+        url_list_file = output_dir / "target_urls.txt"
+        url_list_file.write_text('\n'.join(urls))
+
+        # Output files
+        json_output = output_dir / "nuclei_results.json"
+        markdown_output = output_dir / "nuclei_results.md"
+        sarif_output = output_dir / "nuclei_results.sarif"
+        self.last_json_output = json_output
+        self.last_markdown_output = markdown_output
+        self.last_sarif_output = sarif_output
+
+        # Build Nuclei command
+        executable = config.get('tools.nuclei.executable', 'nuclei')
+        command = [
+            executable,
+            '-l', str(url_list_file),           # List of targets
+            '-severity', severity,               # Filter by severity
+            '-json-export', str(json_output),    # JSON output
+            '-markdown-export', str(markdown_output),  # Markdown report
+            '-sarif-export', str(sarif_output),  # SARIF format
+            '-stats',                            # Show statistics
+            '-silent',                           # Reduce noise
+            '-timeout', '10',                    # Request timeout
+            '-retries', '2',                     # Retry failed requests
+            '-rate-limit', '150',                # Requests per second
+            '-bulk-size', '25',                  # Concurrent hosts
+            '-c', '25'                           # Concurrent templates
+        ]
+
+        logger.info(f"🔬 Nuclei scanning {len(urls)} URLs with severity: {severity}")
+        logger.log_command_execution(command, str(self.results_dir))
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                cwd=str(self.results_dir)
+            )
+
+            if result.stdout and result.stdout.strip():
+                logger.log_tool_output('nuclei', result.stdout, False)
+            if result.stderr and result.stderr.strip():
+                logger.log_tool_output('nuclei', result.stderr, True)
+
+            # Parse results
+            vulnerabilities_found: List[Dict[str, Any]] = []
+            critical_count = high_count = medium_count = low_count = info_count = 0
+
+            if json_output.exists() and json_output.stat().st_size > 0:
+                try:
+                    import json
+                    content = json_output.read_text().strip()
+                    parsed_objects: List[Dict[str, Any]] = []
+
+                    if content:
+                        try:
+                            parsed = json.loads(content)
+                            if isinstance(parsed, dict):
+                                parsed_objects.append(parsed)
+                            elif isinstance(parsed, list):
+                                parsed_objects.extend([item for item in parsed if isinstance(item, dict)])
+                        except json.JSONDecodeError:
+                            for line in content.splitlines():
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    parsed_line = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                if isinstance(parsed_line, dict):
+                                    parsed_objects.append(parsed_line)
+                                elif isinstance(parsed_line, list):
+                                    parsed_objects.extend([item for item in parsed_line if isinstance(item, dict)])
+
+                    for vuln in parsed_objects:
+                        vulnerabilities_found.append(vuln)
+                        severity_level = vuln.get('info', {}).get('severity', '').lower()
+                        if severity_level == 'critical':
+                            critical_count += 1
+                        elif severity_level == 'high':
+                            high_count += 1
+                        elif severity_level == 'medium':
+                            medium_count += 1
+                        elif severity_level == 'low':
+                            low_count += 1
+                        elif severity_level == 'info':
+                            info_count += 1
+
+                except Exception as e:
+                    logger.warning(f"Error parsing Nuclei JSON output: {e}")
+
+            # Build summary message
+            if vulnerabilities_found:
+                summary_parts = []
+                if critical_count > 0:
+                    summary_parts.append(f"🚨 {critical_count} CRITICAL")
+                if high_count > 0:
+                    summary_parts.append(f"⚠️ {high_count} HIGH")
+                if medium_count > 0:
+                    summary_parts.append(f"⚡ {medium_count} MEDIUM")
+                if low_count > 0:
+                    summary_parts.append(f"ℹ️ {low_count} LOW")
+                if info_count > 0:
+                    summary_parts.append(f"📝 {info_count} INFO")
+
+                summary = f"✅ Nuclei found {len(vulnerabilities_found)} vulnerabilities: {', '.join(summary_parts)}"
+
+                for vuln in vulnerabilities_found[:5]:
+                    info = vuln.get('info', {})
+                    template = info.get('name', 'Unknown')
+                    severity_level = info.get('severity', 'unknown').upper()
+                    matched_at = vuln.get('matched-at', vuln.get('host', 'unknown'))
+                    logger.info(f"  [{severity_level}] {template} at {matched_at}")
+
+                if len(vulnerabilities_found) > 5:
+                    logger.info(f"  ... and {len(vulnerabilities_found) - 5} more")
+
+                return True, summary
+
+            if result.returncode != 0:
+                return False, f"Nuclei exited with status {result.returncode}. See logs for details."
+
+            return True, f"Nuclei completed: Scanned {len(urls)} URLs, no vulnerabilities found"
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Nuclei scan timeout after {self.timeout} seconds")
+            return False, f"Nuclei scan timeout (limit: {self.timeout}s)"
+        except Exception as e:
+            logger.error(f"Nuclei error: {e}")
+            return False, f"Nuclei scan failed: {str(e)}"
+
+    def update_templates(self) -> Tuple[bool, str]:
+        """Update Nuclei templates to latest version."""
+        logger.info("📥 Updating Nuclei templates...")
+
+        try:
+            result = subprocess.run(
+                ['nuclei', '-update-templates'],
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minutes for template update
+            )
+
+            if result.returncode == 0:
+                logger.info("✅ Nuclei templates updated successfully")
+                return True, "Nuclei templates updated"
+            else:
+                logger.warning(f"Nuclei template update failed: {result.stderr}")
+                return False, f"Template update failed: {result.stderr}"
+        except Exception as e:
+            logger.error(f"Nuclei template update error: {e}")
+            return False, f"Template update error: {str(e)}"
+
+# =============================================================================
 # CORE ORCHESTRATION
 # =============================================================================
 
@@ -2159,9 +2715,9 @@ class Orchestrator:
         # Initialize tool wrappers
         self.nmap_wrapper = NmapWrapper(self.results_dir)
         self.searchsploit_wrapper = SearchsploitWrapper(self.results_dir)
-        self.nikto_wrapper = NiktoWrapper(self.results_dir)
         self.enum4linux_wrapper = Enum4LinuxWrapper(self.results_dir)
-        self.w3af_wrapper = W3afWrapper(self.results_dir)
+        self.wapiti_wrapper = WapitiWrapper(self.results_dir)
+        self.nuclei_wrapper = NucleiWrapper(self.results_dir)
         self.metasploit_wrapper = MetasploitWrapper(self.results_dir)
 
     def run_comprehensive_scan(self, nmap_command: str, target_ip: Optional[str] = None,
@@ -2177,9 +2733,9 @@ class Orchestrator:
             steps = [
                 ('nmap', 'Nmap Port Scanning', self._run_nmap_step),
                 ('searchsploit', 'Exploit Database Search', self._run_searchsploit_step),
-                ('nikto', 'Web Vulnerability Scanning', self._run_nikto_step),
                 ('enum4linux', 'SMB Enumeration', self._run_enum4linux_step),
-                ('w3af', 'Web Application Scanning', self._run_w3af_step),
+                ('wapiti', 'Web Application Scanning (Wapiti)', self._run_wapiti_step),
+                ('nuclei', 'Vulnerability Scanning (Nuclei)', self._run_nuclei_step),
                 ('metasploit', 'Metasploit Exploit Suggestions', self._run_metasploit_step)
             ]
 
@@ -2207,17 +2763,33 @@ class Orchestrator:
 
             self.scan_results.set_metadata('scan_end_time', datetime.now())
 
-            # Generate final report
-            report_path = self.results_dir / "final_report.txt"
+            # Generate final text report
+            report_path = self.results_dir / f"final_report_{target_ip.replace(".", "_").replace(":", "_") if target_ip else "unknown"}.txt"
             report_content = self._generate_final_report()
 
             with open(report_path, 'w', encoding='utf-8') as f:
                 f.write(report_content)
 
+            # Generate PDF report
+            try:
+                raw_outputs = self._gather_raw_output_paths()
+                pdf_generator = PDFReportGenerator(
+                    self.results_dir,
+                    self.scan_results,
+                    target_ip=target_ip,
+                    raw_outputs=raw_outputs
+                )
+                pdf_path = pdf_generator.generate_pdf(nmap_command, target_ip=target_ip)
+                logger.info(f"📄 PDF Report generated: {pdf_path}")
+            except Exception as e:
+                logger.error(f"Failed to generate PDF report: {e}")
+                pdf_path = None
+
             logger.end_scan_session()
 
             success = successful_steps > 0
-            message = f"Comprehensive scan completed. {successful_steps}/{len(steps)} tools successful. Report: {report_path}"
+            pdf_msg = f"\n📄 PDF Report: {pdf_path}" if pdf_path else ""
+            message = f"Comprehensive scan completed. {successful_steps}/{len(steps)} tools successful.\n📋 Text Report: {report_path}{pdf_msg}"
 
             return success, message
 
@@ -2242,24 +2814,12 @@ class Orchestrator:
         if not self.searchsploit_wrapper.check_availability():
             return False, "Searchsploit not available"
 
-        nmap_xml = self.results_dir / "nmap_result.xml"
+        # Use the actual XML file created by NmapWrapper
+        nmap_xml = self.nmap_wrapper.xml_output_file
         success, message = self.searchsploit_wrapper.run_nmap_search(nmap_xml)
         if success:
             searchsploit_results = self.searchsploit_wrapper.parse_results()
             self.scan_results.add_tool_result('searchsploit', searchsploit_results)
-
-        return success, message
-
-    def _run_nikto_step(self, nmap_command: str, target_ip: Optional[str] = None) -> Tuple[bool, str]:
-        """Execute Nikto scanning step."""
-        if not self.nikto_wrapper.check_availability():
-            return False, "Nikto not available"
-
-        http_ports = self.nmap_wrapper.get_http_ports()
-        success, message = self.nikto_wrapper.scan_http_services(http_ports)
-        if success:
-            nikto_results = self.nikto_wrapper.get_scan_summary()
-            self.scan_results.add_tool_result('nikto', nikto_results)
 
         return success, message
 
@@ -2279,16 +2839,42 @@ class Orchestrator:
 
         return success, message
 
-    def _run_w3af_step(self, nmap_command: str, target_ip: Optional[str] = None) -> Tuple[bool, str]:
-        """Execute w3af scanning step."""
-        if not self.w3af_wrapper.check_availability():
-            return False, "w3af not available"
+    def _run_wapiti_step(self, nmap_command: str, target_ip: Optional[str] = None) -> Tuple[bool, str]:
+        """Execute Wapiti scanning step."""
+        if not self.wapiti_wrapper.check_availability():
+            return False, "Wapiti not available"
 
         http_ports = self.nmap_wrapper.get_http_ports()
-        success, message = self.w3af_wrapper.run_scan(http_ports)
+        success, message = self.wapiti_wrapper.run_scan(http_ports)
         if success:
-            w3af_results = self.w3af_wrapper.parse_results()
-            self.scan_results.add_tool_result('w3af', w3af_results)
+            wapiti_results = self.wapiti_wrapper.parse_results()
+            self.scan_results.add_tool_result('wapiti', wapiti_results)
+
+        return success, message
+
+    def _run_nuclei_step(self, nmap_command: str, target_ip: Optional[str] = None) -> Tuple[bool, str]:
+        """Execute Nuclei vulnerability scanning step."""
+        if not self.nuclei_wrapper.check_availability():
+            return False, "Nuclei not available"
+
+        # Get HTTP ports from nmap
+        http_ports = self.nmap_wrapper.get_http_ports()
+        if not http_ports:
+            return True, "No HTTP services found for Nuclei"
+
+        # Extract URLs
+        urls = [port_info['url'] for port_info in http_ports]
+
+        # Run Nuclei with critical, high, and medium severity
+        success, message = self.nuclei_wrapper.scan_targets(urls, severity="critical,high,medium")
+
+        if success:
+            nuclei_results = {
+                'urls_scanned': len(urls),
+                'status': 'completed',
+                'severity_filter': 'critical,high,medium'
+            }
+            self.scan_results.add_tool_result('nuclei', nuclei_results)
 
         return success, message
 
@@ -2311,173 +2897,645 @@ class Orchestrator:
 
         return success, message
 
-    def _generate_final_report(self) -> str:
-        """Generate the comprehensive final report."""
-        lines = []
+    def _aggregate_all_vulnerabilities(self) -> List[Dict[str, Any]]:
+        """Aggregate vulnerabilities from all tools into a single unified list."""
+        all_vulnerabilities = []
 
-        # Header
+        # Extract from Nmap (open ports as informational findings)
+        nmap_results = self.scan_results.get_tool_result('nmap')
+        if nmap_results and 'hosts' in nmap_results:
+            for host in nmap_results['hosts']:
+                for port in host.get('ports', []):
+                    if port.get('state', {}).get('state') == 'open':
+                        service = port.get('service', {})
+                        all_vulnerabilities.append({
+                            'title': f"Open Port: {port.get('portid')}/{port.get('protocol')} - {service.get('name', 'unknown')}",
+                            'type': 'open_port',
+                            'severity': 'low',  # Open ports are informational
+                            'source': 'nmap',
+                            'port': port.get('portid'),
+                            'service': service.get('name', ''),
+                            'product': service.get('product', ''),
+                            'version': service.get('version', ''),
+                            'description': f"Service {service.get('name')} running on port {port.get('portid')}"
+                        })
+
+        # Extract from Searchsploit (known exploits/vulnerabilities)
+        searchsploit_results = self.scan_results.get_tool_result('searchsploit')
+        if searchsploit_results:
+            vulnerabilities = searchsploit_results.get('vulnerabilities', [])
+            for vuln in vulnerabilities:
+                all_vulnerabilities.append({
+                    'title': vuln.get('title', 'Unknown Exploit'),
+                    'type': vuln.get('type', 'known_exploit'),
+                    'severity': vuln.get('severity', 'medium'),
+                    'source': 'searchsploit',
+                    'service': vuln.get('service', ''),
+                    'platform': vuln.get('platform', ''),
+                    'description': vuln.get('description', ''),
+                    'path': vuln.get('path', ''),
+                    'cve': vuln.get('cve', '')
+                })
+
+        # Extract from Wapiti (web vulnerabilities)
+        wapiti_results = self.scan_results.get_tool_result('wapiti')
+        if wapiti_results:
+            vulnerabilities = wapiti_results.get('vulnerabilities', [])
+            for vuln in vulnerabilities:
+                all_vulnerabilities.append({
+                    'title': f"{vuln.get('type', 'Web Vulnerability')} - {vuln.get('name', 'Unknown')}",
+                    'type': vuln.get('type', 'web_vulnerability'),
+                    'severity': vuln.get('severity', 'medium'),
+                    'source': 'wapiti',
+                    'description': vuln.get('description', ''),
+                    'url': vuln.get('url', ''),
+                    'remediation': vuln.get('remediation', '')
+                })
+
+        # Extract from Enum4Linux (SMB findings)
+        enum4linux_results = self.scan_results.get_tool_result('enum4linux')
+        if enum4linux_results:
+            # Users found
+            users = enum4linux_results.get('users', [])
+            if users:
+                all_vulnerabilities.append({
+                    'title': f"SMB Users Enumerated ({len(users)} found)",
+                    'type': 'enumeration',
+                    'severity': 'medium',
+                    'source': 'enum4linux',
+                    'description': f"Found {len(users)} user accounts through SMB enumeration: " + ", ".join([u.get('username', 'N/A') for u in users[:5]]),
+                    'service': 'smb'
+                })
+
+            # Shares found
+            shares = enum4linux_results.get('shares', [])
+            if shares:
+                all_vulnerabilities.append({
+                    'title': f"SMB Shares Enumerated ({len(shares)} found)",
+                    'type': 'enumeration',
+                    'severity': 'low',
+                    'source': 'enum4linux',
+                    'description': f"Found {len(shares)} shares through SMB enumeration: " + ", ".join([s.get('name', 'N/A') for s in shares[:5]]),
+                    'service': 'smb'
+                })
+
+        # Extract from SQLMap (SQL injection vulnerabilities)
+        sqlmap_results = self.scan_results.get_tool_result('sqlmap')
+        if sqlmap_results:
+            vulnerabilities = sqlmap_results.get('vulnerabilities_found', [])
+            for vuln in vulnerabilities:
+                all_vulnerabilities.append({
+                    'title': "SQL Injection Vulnerability",
+                    'type': 'sql_injection',
+                    'severity': 'critical',
+                    'source': 'sqlmap',
+                    'description': vuln.get('vulnerability', 'SQL injection detected'),
+                    'url': vuln.get('url', ''),
+                    'parameter': vuln.get('parameter', ''),
+                    'remediation': 'Use parameterized queries and input validation'
+                })
+
+        # Extract from Hydra (weak credentials - if any successful)
+        hydra_results = self.scan_results.get_tool_result('hydra')
+        if hydra_results and hydra_results.get('successful_attempts', []):
+            for attempt in hydra_results.get('successful_attempts', []):
+                all_vulnerabilities.append({
+                    'title': f"Weak Credentials: {attempt.get('service')} - {attempt.get('username')}",
+                    'type': 'weak_credentials',
+                    'severity': 'critical',
+                    'source': 'hydra',
+                    'description': f"Service {attempt.get('service')} has weak credentials: {attempt.get('username')}:{attempt.get('password')}",
+                    'service': attempt.get('service', ''),
+                    'remediation': 'Change default and weak credentials immediately'
+                })
+
+        return all_vulnerabilities
+
+    def _generate_final_report(self) -> str:
+        """Generate final report that embeds raw tool outputs under clear headings."""
+        lines: List[str] = []
+
+        generated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        target_ip = self.scan_results.get_metadata('target_ip') or 'Unknown'
+        nmap_command = self.scan_results.get_metadata('nmap_command') or 'N/A'
+
         lines.extend([
-            "=" * 80,
-            "FINAL ATTACK PATH REPORT",
-            "Generated by Security Orchestrator",
-            f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "=" * 80,
+            "=" * 100,
+            "SECURITY ORCHESTRATOR FINAL REPORT",
+            f"Generated: {generated_at}",
+            f"Target IP: {target_ip}",
+            f"Nmap Command: {nmap_command}",
+            "=" * 100,
+            "",
+            "RAW TOOL OUTPUTS",
+            "----------------",
             ""
         ])
 
-        # Target Information
+        def normalize_paths(path_candidates: Iterable[Optional[Path]]) -> List[Path]:
+            unique_paths: List[Path] = []
+            for candidate in path_candidates:
+                if not candidate:
+                    continue
+                file_path = Path(candidate)
+                if file_path not in unique_paths:
+                    unique_paths.append(file_path)
+            return unique_paths
+
+        def safe_read_file(file_path: Path) -> str:
+            try:
+                return file_path.read_text(encoding='utf-8', errors='replace')
+            except Exception as exc:
+                logger.error(f"Failed to read {file_path}: {exc}")
+                return f"[!] Unable to read file {file_path}: {exc}"
+
+        def append_section(title: str, path_candidates: Iterable[Optional[Path]]) -> None:
+            lines.append(title)
+            lines.append('-' * len(title))
+
+            normalized = normalize_paths(path_candidates)
+            if not normalized:
+                lines.append("No output files were generated for this tool.")
+                lines.append("")
+                return
+
+            found_valid_file = False
+            for path in normalized:
+                if path.exists() and path.is_file():
+                    found_valid_file = True
+                    lines.append(f"File: {path}")
+                    lines.append("")
+                    content = safe_read_file(path)
+                    lines.append(content)
+                    if not content.endswith('\n'):
+                        lines.append("")
+                else:
+                    lines.append(f"File not found: {path}")
+                    lines.append("")
+
+            if not found_valid_file:
+                lines.append("No output files were found for this tool.")
+                lines.append("")
+
+        # Nmap output (XML)
+        append_section("Nmap Output", [self.nmap_wrapper.xml_output_file])
+
+        # Searchsploit output
+        append_section("Searchsploit Output", [self.searchsploit_wrapper.output_file])
+
+        # Enum4linux output
+        append_section("Enum4linux Output", [self.enum4linux_wrapper.output_file])
+
+        # Wapiti outputs (individual scans + merged report)
+        wapiti_paths: List[Optional[Path]] = [self.wapiti_wrapper.output_file]
+        wapiti_paths.extend(getattr(self.wapiti_wrapper, 'individual_output_files', []))
+        append_section("Wapiti Output", wapiti_paths)
+
+        # Nuclei outputs (JSON, Markdown, SARIF)
+        nuclei_paths: List[Optional[Path]] = [
+            getattr(self.nuclei_wrapper, 'last_json_output', None),
+            getattr(self.nuclei_wrapper, 'last_markdown_output', None),
+            getattr(self.nuclei_wrapper, 'last_sarif_output', None)
+        ]
+        append_section("Nuclei Output", nuclei_paths)
+
+        # Metasploit suggestions
+        append_section("Metasploit Output", [self.metasploit_wrapper.output_file])
+
         lines.extend([
-            "TARGET INFORMATION",
-            "-" * 20
+            "=" * 100,
+            "End of Report",
+            "=" * 100,
         ])
 
-        target_ip = self.scan_results.get_metadata('target_ip')
-        nmap_command = self.scan_results.get_metadata('nmap_command')
+        return '\n'.join(lines)
 
-        if target_ip:
-            lines.append(f"Target IP: {target_ip}")
-        if nmap_command:
-            lines.append(f"Nmap Command: {nmap_command}")
+    def _gather_raw_output_paths(self) -> Dict[str, List[Path]]:
+        """Collect raw output file paths for each tool for reporting."""
+        outputs: Dict[str, List[Path]] = {}
 
-        lines.append("")
+        def add_paths(label: str, candidates: Iterable[Optional[Path]]):
+            bucket = outputs.setdefault(label, [])
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                path_obj = Path(candidate)
+                if path_obj not in bucket:
+                    bucket.append(path_obj)
 
-        # Nmap Port Findings
+        add_paths("Nmap Output", [self.nmap_wrapper.xml_output_file])
+        add_paths("Searchsploit Output", [self.searchsploit_wrapper.output_file])
+        add_paths("Enum4linux Output", [self.enum4linux_wrapper.output_file])
+
+        wapiti_paths: List[Optional[Path]] = [self.wapiti_wrapper.output_file]
+        wapiti_paths.extend(getattr(self.wapiti_wrapper, 'individual_output_files', []))
+        add_paths("Wapiti Output", wapiti_paths)
+
+        nuclei_candidates = [
+            getattr(self.nuclei_wrapper, 'last_json_output', None),
+            getattr(self.nuclei_wrapper, 'last_markdown_output', None),
+            getattr(self.nuclei_wrapper, 'last_sarif_output', None)
+        ]
+        add_paths("Nuclei Output", nuclei_candidates)
+
+        add_paths("Metasploit Output", [self.metasploit_wrapper.output_file])
+
+        return outputs
+
+
+# =============================================================================
+# PDF REPORT GENERATOR
+# =============================================================================
+
+class PDFReportGenerator:
+    """Generate PDF reports from scan results."""
+
+    def __init__(self, results_dir: Path, scan_results: 'ScanResults', target_ip: str = None,
+                 raw_outputs: Optional[Dict[str, List[Path]]] = None):
+        self.results_dir = results_dir
+        self.scan_results = scan_results
+        self.target_ip = target_ip
+        self.raw_outputs = raw_outputs or {}
+        self.styles = getSampleStyleSheet()
+        self._setup_custom_styles()
+
+    def _setup_custom_styles(self):
+        """Setup custom paragraph styles."""
+        self.styles.add(ParagraphStyle(
+            name='CustomTitle',
+            parent=self.styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#1a237e'),
+            spaceAfter=30,
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold'
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='SectionHeader',
+            parent=self.styles['Heading2'],
+            fontSize=16,
+            textColor=colors.HexColor('#283593'),
+            spaceAfter=12,
+            spaceBefore=12,
+            fontName='Helvetica-Bold'
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='VulnHigh',
+            parent=self.styles['Normal'],
+            textColor=colors.red,
+            fontName='Helvetica-Bold'
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='VulnMedium',
+            parent=self.styles['Normal'],
+            textColor=colors.orange,
+            fontName='Helvetica-Bold'
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='VulnLow',
+            parent=self.styles['Normal'],
+            textColor=colors.blue,
+            fontName='Helvetica'
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='SubSectionHeader',
+            parent=self.styles['Heading3'],
+            fontSize=13,
+            textColor=colors.HexColor('#00695c'),
+            spaceBefore=14,
+            spaceAfter=8,
+            fontName='Helvetica-Bold'
+        ))
+
+        self.styles.add(ParagraphStyle(
+            name='RawOutput',
+            parent=self.styles['Normal'],
+            fontName='Courier',
+            fontSize=8,
+            leading=10,
+            spaceAfter=12
+        ))
+
+    def generate_pdf(self, nmap_command: str, target_ip: str = None, output_file: str = None) -> str:
+        """Generate comprehensive PDF report with all raw tool outputs."""
+        if target_ip is None:
+            target_ip = self.target_ip
+
+        if output_file is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            sanitized_ip = target_ip.replace(".", "_").replace(":", "_") if target_ip else "unknown"
+            output_file = self.results_dir / f"security_report_{sanitized_ip}_{timestamp}.pdf"
+
+        doc = SimpleDocTemplate(str(output_file), pagesize=letter,
+                                rightMargin=50, leftMargin=50,
+                                topMargin=50, bottomMargin=30)
+
+        story = []
+
+        # Title Page
+        story.append(Paragraph("COMPREHENSIVE SECURITY ASSESSMENT REPORT", self.styles['CustomTitle']))
+        story.append(Spacer(1, 12))
+        story.append(Paragraph(f"Target: {target_ip or 'Unknown'}", self.styles['Normal']))
+        story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %H:%M:%S')}",
+                               self.styles['Normal']))
+        story.append(Paragraph(f"Scan Command: {nmap_command}", self.styles['Normal']))
+        story.append(Spacer(1, 30))
+
+        # Direct raw output sections for all tools
+        story.append(Paragraph("ALL TOOL OUTPUTS - RAW RESULTS", self.styles['SectionHeader']))
+        story.append(Paragraph(
+            "This report contains the complete, unmodified output from all security scanning tools. "
+            "Each section below presents the raw data exactly as produced by the respective tool.",
+            self.styles['Normal']
+        ))
+        story.append(Spacer(1, 20))
+
+        # Append all raw tool outputs directly
+        self._append_raw_output_sections(story)
+
+        # Build PDF
+        doc.build(story)
+        logger.info(f"PDF report generated: {output_file}")
+        return str(output_file)
+
+    def _generate_executive_summary(self, nmap_command: str) -> str:
+        """Generate executive summary."""
         nmap_results = self.scan_results.get_tool_result('nmap')
-        if nmap_results and 'hosts' in nmap_results:
-            lines.extend([
-                "NMAP PORT FINDINGS",
-                "-" * 18
-            ])
+        total_hosts = len(nmap_results.get('hosts', [])) if nmap_results else 0
+        total_ports = sum(len(h.get('ports', [])) for h in nmap_results.get('hosts', [])) if nmap_results else 0
+        target_ip = self.target_ip or 'Unknown'
 
-            for host in nmap_results['hosts']:
-                for addr in host.get('addresses', []):
-                    if addr.get('addrtype') == 'ipv4':
-                        lines.append(f"Host: {addr['addr']}")
-                        break
+        wapiti_results = self.scan_results.get_tool_result('wapiti')
+        total_vulns = wapiti_results.get('total_vulnerabilities', 0) if wapiti_results else 0
 
-                for port in host.get('ports', []):
-                    if port.get('state', {}).get('state') == 'open':
-                        port_id = port.get('portid', 'N/A')
-                        service_name = port.get('service', {}).get('name', 'unknown')
-                        product = port.get('service', {}).get('product', '')
-                        version = port.get('service', {}).get('version', '')
+        summary = f"""
+        This security assessment was conducted using automated reconnaissance and vulnerability scanning tools.
+        The scan targeted systems based on the command: <b>{nmap_command}</b>
+        <br/><br/>
+        <b>Key Findings:</b><br/>
+        • Primary Target: {target_ip}<br/>
+        • Hosts Scanned: {total_hosts}<br/>
+        • Open Ports Discovered: {total_ports}<br/>
+        • Web Vulnerabilities Found: {total_vulns}<br/>
+        • Tools Used: Nmap, Searchsploit, Wapiti, Enum4linux, Metasploit
+        """
+        return summary
 
-                        service_info = f"{service_name}"
-                        if product:
-                            service_info += f" {product}"
-                        if version:
-                            service_info += f" {version}"
+    def _generate_nmap_section(self, results: dict) -> list:
+        """Generate Nmap results section."""
+        elements = []
 
-                        lines.append(f"  {port_id}/tcp - {service_info}")
+        for host in results.get('hosts', []):
+            ip = host.get('ip', 'Unknown')
+            elements.append(Paragraph(f"<b>Target: {ip}</b>", self.styles['Normal']))
+            elements.append(Spacer(1, 6))
 
-            lines.append("")
+            if host.get('ports'):
+                data = [['Port', 'State', 'Service', 'Version']]
+                for port in host['ports']:
+                    data.append([
+                        str(port.get('port', '')),
+                        port.get('state', ''),
+                        port.get('service', ''),
+                        port.get('version', '')
+                    ])
 
-        # Searchsploit Vulnerabilities
-        searchsploit_results = self.scan_results.get_tool_result('searchsploit')
-        if searchsploit_results and 'exploits' in searchsploit_results:
-            lines.extend([
-                "SEARCHSPLOIT VULNERABILITIES",
-                "-" * 27
-            ])
+                table = Table(data, colWidths=[1*inch, 1*inch, 1.5*inch, 3*inch])
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#283593')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 12),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                elements.append(table)
+                elements.append(Spacer(1, 12))
 
-            for exploit in searchsploit_results['exploits'][:20]:  # Top 20
-                lines.append(f"ID: {exploit.get('id', 'N/A')}")
-                lines.append(f"Title: {exploit.get('title', 'N/A')}")
-                lines.append(f"Platform: {exploit.get('platform', 'N/A')}")
-                if exploit.get('local_file'):
-                    lines.append(f"Local File: {exploit['local_file']}")
-                lines.append("")
+        return elements
 
-        # Nikto Findings
-        nikto_results = self.scan_results.get_tool_result('nikto')
-        if nikto_results and 'top_vulnerabilities' in nikto_results:
-            lines.extend([
-                "NIKTO WEB VULNERABILITIES",
-                "-" * 25
-            ])
+    def _generate_searchsploit_section(self, results: dict) -> list:
+        """Generate Searchsploit results section."""
+        elements = []
 
-            for vuln in nikto_results['top_vulnerabilities'][:15]:  # Top 15
-                lines.append(f"URL: {vuln.get('url', 'N/A')}")
-                lines.append(f"Severity: {vuln.get('severity', 'N/A').upper()}")
-                lines.append(f"Description: {vuln.get('description', 'N/A')}")
-                lines.append("")
+        if results.get('exploits'):
+            data = [['Exploit Title', 'Path', 'Type']]
+            for exploit in results['exploits'][:15]:  # Top 15
+                data.append([
+                    exploit.get('title', '')[:50],
+                    exploit.get('path', '')[:40],
+                    exploit.get('type', '')
+                ])
 
-        # enum4linux Results
-        enum4linux_results = self.scan_results.get_tool_result('enum4linux')
-        if enum4linux_results:
-            lines.extend([
-                "ENUM4LINUX SMB ENUMERATION",
-                "-" * 27
-            ])
+            table = Table(data, colWidths=[3*inch, 2.5*inch, 1*inch])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#c62828')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.lightgrey),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            elements.append(table)
+        else:
+            elements.append(Paragraph("No exploits found in database.", self.styles['Normal']))
 
-            if enum4linux_results.get('users'):
-                lines.append(f"Users Found: {len(enum4linux_results['users'])}")
-                for user in enum4linux_results['users'][:10]:  # Top 10
-                    lines.append(f"  - {user.get('username', 'N/A')}")
+        return elements
 
-            if enum4linux_results.get('shares'):
-                lines.append(f"Shares Found: {len(enum4linux_results['shares'])}")
-                for share in enum4linux_results['shares'][:10]:  # Top 10
-                    lines.append(f"  - {share.get('name', 'N/A')} ({share.get('type', 'N/A')})")
+    def _generate_nikto_section(self, results: dict) -> list:
+        """Generate Nikto results section."""
+        elements = []
 
-            lines.append("")
+        total_vulns = results.get('total_vulnerabilities', 0)
+        elements.append(Paragraph(f"<b>Total Issues Found: {total_vulns}</b>", self.styles['Normal']))
+        elements.append(Spacer(1, 12))
 
-        # w3af Findings
-        w3af_results = self.scan_results.get_tool_result('w3af')
-        if w3af_results and 'vulnerabilities' in w3af_results:
-            lines.extend([
-                "W3AF WEB APPLICATION FINDINGS",
-                "-" * 30
-            ])
+        if results.get('vulnerabilities'):
+            for vuln in results['vulnerabilities'][:20]:  # Top 20
+                severity = vuln.get('severity', 'low').lower()
+                style = self.styles['VulnHigh'] if 'high' in severity else \
+                        self.styles['VulnMedium'] if 'medium' in severity else \
+                        self.styles['VulnLow']
 
-            for vuln in w3af_results['vulnerabilities'][:10]:  # Top 10
-                lines.append(f"Type: {vuln.get('type', 'N/A')}")
-                lines.append(f"Severity: {vuln.get('severity', 'N/A').upper()}")
-                lines.append(f"Description: {vuln.get('description', 'N/A')}")
-                lines.append("")
+                elements.append(Paragraph(f"• [{vuln.get('severity', 'N/A').upper()}] {vuln.get('message', 'N/A')}", style))
+                elements.append(Spacer(1, 6))
 
-        # Metasploit Suggestions
-        metasploit_results = self.scan_results.get_tool_result('metasploit')
-        if metasploit_results and metasploit_results.get('suggestions_generated'):
-            lines.extend([
-                "METASPLOIT EXPLOIT SUGGESTIONS",
-                "-" * 32
-            ])
+        return elements
 
-            metasploit_file = self.results_dir / "metasploit_suggestions.txt"
-            if metasploit_file.exists():
-                lines.append(f"See detailed suggestions in: {metasploit_file}")
-                lines.append("")
-                lines.append("Key Metasploit modules for this target:")
-                lines.append("- EternalBlue (MS17-010): exploit/windows/smb/ms17_010_eternalblue")
-                lines.append("- SMB Login Scanner: auxiliary/scanner/smb/smb_login")
-                lines.append("- MySQL Login: auxiliary/scanner/mysql/mysql_login")
-                lines.append("")
-            else:
-                lines.append("Metasploit suggestions generated but file not found.")
-                lines.append("")
+    def _generate_wapiti_section(self, results: dict) -> list:
+        """Generate Wapiti results section."""
+        elements = []
 
-        # Artifacts
-        lines.extend([
-            "ARTIFACTS GENERATED",
-            "-" * 19,
-            f"results/nmap_result.xml - Nmap XML output",
-            f"results/searchsploit.txt - Exploit database search results",
-            f"results/nikto_*.xml - Nikto scan results per service",
-            f"results/nikto_summary.txt - Nikto findings summary",
-            f"results/enum4linux.txt - SMB enumeration results",
-            f"results/w3af_script.w3af - w3af scan script",
-            f"results/w3af_report.txt - w3af scan output",
-            f"results/metasploit_suggestions.txt - Metasploit exploit suggestions",
-            f"results/final_report.txt - This report",
-            f"results/scan.log - Detailed execution log",
-            "",
-            "=" * 80,
-            "END OF REPORT",
-            "=" * 80
-        ])
+        total_vulns = results.get('total_vulnerabilities', 0)
+        elements.append(Paragraph(f"<b>Total Vulnerabilities: {total_vulns}</b>", self.styles['Normal']))
+        elements.append(Spacer(1, 12))
 
-        return "\n".join(lines)
+        if results.get('vulnerabilities'):
+            # Group by category
+            by_category = {}
+            for vuln in results['vulnerabilities']:
+                cat = vuln.get('category', 'Other')
+                if cat not in by_category:
+                    by_category[cat] = []
+                by_category[cat].append(vuln)
+
+            for category, vulns in by_category.items():
+                elements.append(Paragraph(f"<b>{category} ({len(vulns)})</b>", self.styles['Normal']))
+                elements.append(Spacer(1, 6))
+
+                for vuln in vulns[:10]:  # Top 10 per category
+                    level = vuln.get('level', 1)
+                    style = self.styles['VulnHigh'] if level >= 2 else self.styles['VulnLow']
+
+                    url = vuln.get('url', 'N/A')
+                    param = vuln.get('parameter', '')
+                    desc = f"{url}"
+                    if param:
+                        desc += f" (Parameter: {param})"
+
+                    elements.append(Paragraph(f"  • {desc}", style))
+                    elements.append(Spacer(1, 4))
+
+                elements.append(Spacer(1, 12))
+
+        return elements
+
+    def _generate_enum4linux_section(self, results: dict) -> list:
+        """Generate Enum4linux results section."""
+        elements = []
+
+        if results.get('users'):
+            elements.append(Paragraph(f"<b>Users Found: {len(results['users'])}</b>", self.styles['Normal']))
+            for user in results['users'][:10]:
+                elements.append(Paragraph(f"  • {user.get('username', 'N/A')}", self.styles['Normal']))
+            elements.append(Spacer(1, 12))
+
+        if results.get('shares'):
+            elements.append(Paragraph(f"<b>Shares Found: {len(results['shares'])}</b>", self.styles['Normal']))
+            for share in results['shares'][:10]:
+                elements.append(Paragraph(f"  • {share.get('name', 'N/A')} ({share.get('type', 'N/A')})",
+                                         self.styles['Normal']))
+            elements.append(Spacer(1, 12))
+
+        return elements
+
+    def _generate_metasploit_section(self, results: dict) -> list:
+        """Generate Metasploit section."""
+        elements = []
+        metasploit_paths = self.raw_outputs.get('Metasploit Output', [])
+        normalized_paths = self._normalize_paths(metasploit_paths)
+
+        existing_file = next((path for path in normalized_paths if path.exists()), None)
+
+        if existing_file:
+            elements.append(Paragraph(
+                f"Metasploit suggestions have been generated. See: {existing_file.name}",
+                self.styles['Normal']
+            ))
+            elements.append(Spacer(1, 8))
+            elements.append(Paragraph("<b>Key Modules to Consider:</b>", self.styles['Normal']))
+            elements.append(Paragraph("• exploit/windows/smb/ms17_010_eternalblue", self.styles['Normal']))
+            elements.append(Paragraph("• auxiliary/scanner/smb/smb_login", self.styles['Normal']))
+            elements.append(Paragraph("• auxiliary/scanner/ssh/ssh_login", self.styles['Normal']))
+        elif normalized_paths:
+            elements.append(Paragraph(
+                "Metasploit output files were generated but could not be located.",
+                self.styles['Normal']
+            ))
+        else:
+            elements.append(Paragraph("No Metasploit suggestions available.", self.styles['Normal']))
+
+        return elements
+
+    def _generate_recommendations(self) -> list:
+        """Generate security recommendations."""
+        elements = []
+
+        recommendations = [
+            ("Patch Management", "Ensure all systems are updated with the latest security patches."),
+            ("Service Hardening", "Disable unnecessary services and close unused ports."),
+            ("Access Controls", "Implement strong authentication and authorization mechanisms."),
+            ("Encryption", "Use encrypted protocols (HTTPS, SSH, FTPS) instead of plaintext alternatives."),
+            ("Monitoring", "Deploy intrusion detection systems and log monitoring solutions."),
+            ("Penetration Testing", "Conduct regular security assessments and penetration tests."),
+        ]
+
+        for title, desc in recommendations:
+            elements.append(Paragraph(f"<b>{title}:</b> {desc}", self.styles['Normal']))
+            elements.append(Spacer(1, 8))
+
+        return elements
+
+    def _normalize_paths(self, path_candidates: Iterable[Optional[Path]]) -> List[Path]:
+        """Normalize iterable of path candidates into unique Path objects."""
+        normalized: List[Path] = []
+        if not path_candidates:
+            return normalized
+
+        for candidate in path_candidates:
+            if not candidate:
+                continue
+            path_obj = Path(candidate)
+            if path_obj not in normalized:
+                normalized.append(path_obj)
+
+        return normalized
+
+    def _append_raw_output_sections(self, story: List[Any]) -> None:
+        """Append raw tool output sections to the PDF story."""
+        if not self.raw_outputs:
+            story.append(Paragraph("No tool outputs available.", self.styles['Normal']))
+            return
+
+        # Process each tool's output
+        for title, paths in self.raw_outputs.items():
+            story.append(PageBreak())
+            story.append(Paragraph(title, self.styles['SectionHeader']))
+            normalized_paths = self._normalize_paths(paths)
+
+            if not normalized_paths:
+                story.append(Paragraph("No output files were generated for this tool.", self.styles['Normal']))
+                story.append(Spacer(1, 12))
+                continue
+
+            for path in normalized_paths:
+                # Add file reference
+                story.append(Paragraph(f"<b>File:</b> {path.name}", self.styles['Normal']))
+                story.append(Paragraph(f"<i>Location:</i> {path}", self.styles['Normal']))
+                story.append(Spacer(1, 8))
+
+                if path.exists():
+                    try:
+                        content = path.read_text(encoding='utf-8', errors='replace')
+                        if content.strip():
+                            # Split very long content into chunks to avoid PDF rendering issues
+                            max_chunk_size = 50000  # ~50KB per chunk
+                            if len(content) > max_chunk_size:
+                                chunks = [content[i:i+max_chunk_size] for i in range(0, len(content), max_chunk_size)]
+                                for idx, chunk in enumerate(chunks):
+                                    if idx > 0:
+                                        story.append(Paragraph(f"<i>... continued (part {idx+1}/{len(chunks)})</i>",
+                                                             self.styles['Normal']))
+                                    story.append(Preformatted(chunk, self.styles['RawOutput']))
+                            else:
+                                story.append(Preformatted(content, self.styles['RawOutput']))
+                        else:
+                            story.append(Paragraph("<i>Output file is empty.</i>", self.styles['Normal']))
+                    except Exception as exc:
+                        story.append(Paragraph(f"<i>Unable to read file: {exc}</i>", self.styles['Normal']))
+                else:
+                    story.append(Paragraph("<i>File not found.</i>", self.styles['Normal']))
+
+                story.append(Spacer(1, 20))
 
 # =============================================================================
 # GUI INTERFACE
@@ -2496,23 +3554,61 @@ class SecurityOrchestratorGUI:
         self.scan_thread = None
         self.scan_running = False
 
+        # Queue for pentest automation inter-thread communication
+        self.pentest_queue = queue.Queue()
+
+        # Storage for pentest results
+        self.pentest_results = {}
+        self.auto_enumerator = None
+        self.external_enumerator = None
+
         # Create GUI elements
         self._create_widgets()
 
         # Check tool availability
         self._check_tools()
 
+        # Start queue processor for pentest automation
+        self._process_pentest_queue()
+
     def _create_widgets(self):
-        """Create all GUI widgets."""
+        """Create all GUI widgets with tabbed interface."""
+        # Main container
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Create notebook (tabbed interface)
+        self.notebook = ttk.Notebook(main_container)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Tab 1: Original Security Orchestrator
+        self.main_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.main_tab, text="Main Scanner")
+        self._create_main_scanner_tab(self.main_tab)
+
+        # Tab 2: Automated Internal Enumeration
+        self.auto_enum_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.auto_enum_tab, text="Automated Enumeration")
+        self._create_automated_enum_tab(self.auto_enum_tab)
+
+        # Tab 3: External OSINT
+        self.osint_tab = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.osint_tab, text="External OSINT")
+        self._create_osint_tab(self.osint_tab)
+
+        # Status bar at bottom
+        self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _create_main_scanner_tab(self, parent):
+        """Create the original main scanner tab."""
         # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        main_frame = ttk.Frame(parent)
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
         # Configure grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(4, weight=1)
+        main_frame.rowconfigure(8, weight=1)
 
         # Title
         title_label = ttk.Label(main_frame, text="Security Orchestrator",
@@ -2525,13 +3621,29 @@ class SecurityOrchestratorGUI:
         self.nmap_text.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=2)
         self.nmap_text.insert(tk.END, "nmap -sV -p 1-1000 192.168.1.100")
 
+        # Port Scan Options
+        port_scan_frame = ttk.LabelFrame(main_frame, text="Port Scan Options", padding="5")
+        port_scan_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+
+        self.port_scan_type = tk.StringVar(value="top1000")
+        ttk.Radiobutton(port_scan_frame, text="Top 1000 Ports (Fast - 5-10 min)",
+                       variable=self.port_scan_type, value="top1000",
+                       command=self._update_nmap_command).grid(row=0, column=0, sticky=tk.W, padx=10)
+        ttk.Radiobutton(port_scan_frame, text="All 65535 Ports (Thorough - 30-60+ min)",
+                       variable=self.port_scan_type, value="allports",
+                       command=self._update_nmap_command).grid(row=0, column=1, sticky=tk.W, padx=10)
+        ttk.Radiobutton(port_scan_frame, text="Custom (Edit command manually)",
+                       variable=self.port_scan_type, value="custom",
+                       command=self._update_nmap_command).grid(row=0, column=2, sticky=tk.W, padx=10)
+
         # Target IP Input with presets
         target_frame = ttk.Frame(main_frame)
-        target_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=2)
+        target_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=2)
 
         ttk.Label(target_frame, text="Target IP/Range (optional):").grid(row=0, column=0, sticky=tk.W)
         self.target_entry = ttk.Entry(target_frame, width=30)
         self.target_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(5, 0))
+        self.target_entry.bind("<KeyRelease>", lambda e: self._update_nmap_command())
 
         ttk.Label(target_frame, text="Quick Presets:").grid(row=0, column=2, sticky=tk.W, padx=(10, 0))
         self.preset_var = tk.StringVar()
@@ -2542,17 +3654,19 @@ class SecurityOrchestratorGUI:
         self.preset_combo.bind("<<ComboboxSelected>>", self._on_preset_selected)
 
         # Output Directory
-        ttk.Label(main_frame, text="Output Directory:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        ttk.Label(main_frame, text="Output Directory:").grid(row=5, column=0, sticky=tk.W, pady=2)
         self.output_frame = ttk.Frame(main_frame)
-        self.output_frame.grid(row=4, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=2)
+        self.output_frame.grid(row=5, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=2)
         self.output_entry = ttk.Entry(self.output_frame, width=40)
         self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.output_entry.insert(0, "results")
+        # Use absolute path from config
+        default_results_dir = str(config.get_results_dir())
+        self.output_entry.insert(0, default_results_dir)
         ttk.Button(self.output_frame, text="Browse", command=self._browse_output_dir).pack(side=tk.RIGHT, padx=(5, 0))
 
         # Control Buttons
         button_frame = ttk.Frame(main_frame)
-        button_frame.grid(row=5, column=0, columnspan=3, pady=10)
+        button_frame.grid(row=6, column=0, columnspan=3, pady=10)
 
         self.scan_button = ttk.Button(button_frame, text="Run Comprehensive Scan",
                                     command=self._start_scan, state=tk.DISABLED)
@@ -2562,29 +3676,183 @@ class SecurityOrchestratorGUI:
                                       command=self._export_report, state=tk.DISABLED)
         self.export_button.pack(side=tk.LEFT)
 
+        self.view_requests_button = ttk.Button(button_frame, text="View Captured Requests",
+                                          command=self._view_captured_requests, state=tk.DISABLED)
+        self.view_requests_button.pack(side=tk.LEFT, padx=(10, 0))
+
         # Progress and Status
-        ttk.Label(main_frame, text="Status:").grid(row=6, column=0, sticky=tk.W, pady=2)
+        ttk.Label(main_frame, text="Status:").grid(row=7, column=0, sticky=tk.W, pady=2)
         self.status_label = ttk.Label(main_frame, text="Ready", foreground="blue")
-        self.status_label.grid(row=6, column=1, sticky=tk.W, pady=2)
+        self.status_label.grid(row=7, column=1, sticky=tk.W, pady=2)
 
         self.progress = ttk.Progressbar(main_frame, orient="horizontal", length=400, mode="determinate")
-        self.progress.grid(row=6, column=2, sticky=(tk.W, tk.E), pady=2)
+        self.progress.grid(row=7, column=2, sticky=(tk.W, tk.E), pady=2)
 
         # Output Console
-        ttk.Label(main_frame, text="Output Console:").grid(row=7, column=0, sticky=tk.W, pady=2)
+        ttk.Label(main_frame, text="Output Console:").grid(row=8, column=0, sticky=tk.W, pady=2)
         self.output_text = scrolledtext.ScrolledText(main_frame, height=20, width=80, wrap=tk.WORD)
-        self.output_text.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=2)
+        self.output_text.grid(row=9, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=2)
 
         # Tool status frame
         tools_frame = ttk.LabelFrame(main_frame, text="Tool Availability", padding="5")
-        tools_frame.grid(row=9, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+        tools_frame.grid(row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
 
         self.tool_labels = {}
-        tools = ['nmap', 'searchsploit', 'nikto', 'enum4linux', 'w3af_console', 'msfconsole']
+        tools = ['nmap', 'searchsploit', 'enum4linux', 'wapiti', 'nuclei', 'msfconsole']
         for i, tool in enumerate(tools):
             ttk.Label(tools_frame, text=f"{tool.replace('_', ' ').title()}:").grid(row=0, column=i*2, sticky=tk.W, padx=5)
             self.tool_labels[tool] = ttk.Label(tools_frame, text="Checking...", foreground="orange")
             self.tool_labels[tool].grid(row=0, column=i*2+1, sticky=tk.W, padx=5)
+
+    def _create_automated_enum_tab(self, parent):
+        """Create automated enumeration tab (based on Automate_Enum.sh)"""
+        # Title and description
+        title_label = ttk.Label(parent, text="Automated Internal Enumeration",
+                               font=("Arial", 14, "bold"))
+        title_label.pack(pady=(0, 5))
+
+        desc_text = """Comprehensive automated enumeration similar to Automate_Enum.sh from Pentest-Scripts.
+Performs Nmap scans, web enumeration (Nikto, WhatWeb, Gobuster), SMB scanning, and visual reconnaissance.
+Results organized in structured folders for each tool."""
+        desc_label = ttk.Label(parent, text=desc_text, justify=tk.LEFT, foreground="gray", wraplength=900)
+        desc_label.pack(pady=(0, 10))
+
+        # Input frame
+        input_frame = ttk.LabelFrame(parent, text="Target Configuration", padding="10")
+        input_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(input_frame, text="Target IP/Range:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.auto_target_entry = ttk.Entry(input_frame, width=40)
+        self.auto_target_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        self.auto_target_entry.insert(0, "192.168.1.100")
+
+        ttk.Label(input_frame, text="Output Directory:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.auto_output_entry = ttk.Entry(input_frame, width=40)
+        self.auto_output_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        self.auto_output_entry.insert(0, str(Path.home() / "Desktop"))
+        ttk.Button(input_frame, text="Browse", command=self._browse_auto_output).grid(row=1, column=2, padx=(5, 0))
+
+        input_frame.columnconfigure(1, weight=1)
+
+        # Port Scan Options (shared with Main Scanner)
+        port_scan_frame = ttk.LabelFrame(parent, text="Nmap Port Scan Options", padding="10")
+        port_scan_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(port_scan_frame, text="Select port scanning mode:",
+                 font=("Arial", 9, "bold")).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 5))
+
+        ttk.Radiobutton(port_scan_frame, text="⚡ Top 1000 Ports (Fast - 5-10 min)",
+                       variable=self.port_scan_type, value="top1000").grid(row=1, column=0, sticky=tk.W, padx=10, pady=2)
+        ttk.Radiobutton(port_scan_frame, text="🔍 All 65535 Ports (Thorough - 30-60+ min)",
+                       variable=self.port_scan_type, value="allports").grid(row=1, column=1, sticky=tk.W, padx=10, pady=2)
+
+        ttk.Label(port_scan_frame, text="Note: This applies to all Nmap scans in both tabs",
+                 foreground="gray", font=("Arial", 8, "italic")).grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+
+        # Tool selection frame
+        tools_frame = ttk.LabelFrame(parent, text="Enumeration Modules", padding="10")
+        tools_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.auto_tool_vars = {}
+        auto_tools = [
+            ('nmap_discovery', 'Nmap Discovery (DNS + Ports + Vuln)', True),
+            ('web_enum', 'Web Enumeration (Nikto, WhatWeb, Gobuster)', True),
+            ('smb_enum', 'SMB Enumeration (enum4linux)', True),
+            ('eyewitness', 'Visual Reconnaissance (EyeWitness)', False)
+        ]
+
+        for i, (key, label, default) in enumerate(auto_tools):
+            var = tk.BooleanVar(value=default)
+            self.auto_tool_vars[key] = var
+            cb = ttk.Checkbutton(tools_frame, text=label, variable=var)
+            cb.grid(row=i//2, column=i%2, sticky=tk.W, padx=10, pady=2)
+
+        # Control buttons
+        button_frame = ttk.Frame(parent)
+        button_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.auto_scan_button = ttk.Button(button_frame, text="Start Automated Enumeration",
+                                          command=self._start_auto_enum)
+        self.auto_scan_button.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.auto_stop_button = ttk.Button(button_frame, text="Stop",
+                                          command=self._stop_auto_enum, state=tk.DISABLED)
+        self.auto_stop_button.pack(side=tk.LEFT)
+
+        self.auto_progress = ttk.Progressbar(button_frame, mode='indeterminate', length=200)
+        self.auto_progress.pack(side=tk.RIGHT)
+
+        # Output console
+        ttk.Label(parent, text="Scan Output:").pack(anchor=tk.W)
+        self.auto_output_text = scrolledtext.ScrolledText(parent, height=20, width=80, wrap=tk.WORD)
+        self.auto_output_text.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+    def _create_osint_tab(self, parent):
+        """Create external OSINT tab (based on External_Enum.sh)"""
+        # Title and description
+        title_label = ttk.Label(parent, text="External OSINT & Domain Enumeration",
+                               font=("Arial", 14, "bold"))
+        title_label.pack(pady=(0, 5))
+
+        desc_text = """External reconnaissance similar to External_Enum.sh from Pentest-Scripts.
+Performs WHOIS lookups, DNS enumeration, subdomain discovery, and email harvesting."""
+        desc_label = ttk.Label(parent, text=desc_text, justify=tk.LEFT, foreground="gray", wraplength=900)
+        desc_label.pack(pady=(0, 10))
+
+        # Input frame
+        input_frame = ttk.LabelFrame(parent, text="Target Configuration", padding="10")
+        input_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(input_frame, text="Target Domain:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.osint_domain_entry = ttk.Entry(input_frame, width=40)
+        self.osint_domain_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        self.osint_domain_entry.insert(0, "example.com")
+
+        ttk.Label(input_frame, text="Output Directory:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.osint_output_entry = ttk.Entry(input_frame, width=40)
+        self.osint_output_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=(5, 0))
+        self.osint_output_entry.insert(0, str(Path.home() / "Desktop"))
+        ttk.Button(input_frame, text="Browse", command=self._browse_osint_output).grid(row=1, column=2, padx=(5, 0))
+
+        input_frame.columnconfigure(1, weight=1)
+
+        # Tool selection frame
+        tools_frame = ttk.LabelFrame(parent, text="OSINT Modules", padding="10")
+        tools_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.osint_tool_vars = {}
+        osint_tools = [
+            ('whois', 'WHOIS Lookup', True),
+            ('theharvester', 'theHarvester (Email/Subdomain)', True),
+            ('dnsrecon', 'DNSRecon', True),
+            ('sublist3r', 'Sublist3r (Subdomain Enum)', True)
+        ]
+
+        for i, (key, label, default) in enumerate(osint_tools):
+            var = tk.BooleanVar(value=default)
+            self.osint_tool_vars[key] = var
+            cb = ttk.Checkbutton(tools_frame, text=label, variable=var)
+            cb.grid(row=i//2, column=i%2, sticky=tk.W, padx=10, pady=2)
+
+        # Control buttons
+        button_frame = ttk.Frame(parent)
+        button_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.osint_scan_button = ttk.Button(button_frame, text="Start OSINT Enumeration",
+                                           command=self._start_osint)
+        self.osint_scan_button.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.osint_stop_button = ttk.Button(button_frame, text="Stop",
+                                           command=self._stop_osint, state=tk.DISABLED)
+        self.osint_stop_button.pack(side=tk.LEFT)
+
+        self.osint_progress = ttk.Progressbar(button_frame, mode='indeterminate', length=200)
+        self.osint_progress.pack(side=tk.RIGHT)
+
+        # Output console
+        ttk.Label(parent, text="OSINT Output:").pack(anchor=tk.W)
+        self.osint_output_text = scrolledtext.ScrolledText(parent, height=20, width=80, wrap=tk.WORD)
+        self.osint_output_text.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
 
     def _check_tools(self):
         """Check availability of all security tools."""
@@ -2592,21 +3860,20 @@ class SecurityOrchestratorGUI:
             wrapper_map = {
                 'nmap': self.orchestrator.nmap_wrapper,
                 'searchsploit': self.orchestrator.searchsploit_wrapper,
-                'nikto': self.orchestrator.nikto_wrapper,
                 'enum4linux': self.orchestrator.enum4linux_wrapper,
-                'w3af_console': self.orchestrator.w3af_wrapper,
+                'wapiti': self.orchestrator.wapiti_wrapper,
+                'nuclei': self.orchestrator.nuclei_wrapper,
                 'msfconsole': self.orchestrator.metasploit_wrapper
             }
-
             if tool_name in wrapper_map:
                 available = wrapper_map[tool_name].check_availability()
                 status = "✓ Available" if available else "✗ Not Found"
                 color = "green" if available else "red"
+                self._update_tool_status(tool_name, status, color)
 
-                self.root.after(0, lambda: self._update_tool_status(tool_name, status, color))
 
         # Check tools in background
-        for tool in ['nmap', 'searchsploit', 'nikto', 'enum4linux', 'w3af_console', 'msfconsole']:
+        for tool in ["nmap", "searchsploit", "enum4linux", "wapiti", "msfconsole", "hydra", "sqlmap", "gobuster"]:
             thread = threading.Thread(target=check_tool, args=(tool,), daemon=True)
             thread.start()
 
@@ -2625,17 +3892,35 @@ class SecurityOrchestratorGUI:
         if preset == "Metasploitable3 (192.168.1.100)":
             self.target_entry.delete(0, tk.END)
             self.target_entry.insert(0, "192.168.1.100")
+            self.port_scan_type.set("custom")  # User can customize
             self.nmap_text.delete("1.0", tk.END)
             self.nmap_text.insert(tk.END, "nmap -sV -p 1-1000,3306,3389,445,80,443,8080 --script vuln 192.168.1.100")
         elif preset == "Localhost (127.0.0.1)":
             self.target_entry.delete(0, tk.END)
             self.target_entry.insert(0, "127.0.0.1")
-            self.nmap_text.delete("1.0", tk.END)
-            self.nmap_text.insert(tk.END, "nmap -sV -p 1-1000 127.0.0.1")
+            self._update_nmap_command()
         elif preset == "Custom":
             self.target_entry.delete(0, tk.END)
             self.nmap_text.delete("1.0", tk.END)
             self.nmap_text.insert(tk.END, "nmap -sV -p 1-1000 ")
+
+    def _update_nmap_command(self):
+        """Update nmap command based on port scan selection and target."""
+        if self.port_scan_type.get() == "custom":
+            return  # Don't auto-update if user wants custom
+
+        target = self.target_entry.get().strip() or "192.168.1.100"
+        scan_type = self.port_scan_type.get()
+
+        if scan_type == "top1000":
+            command = f"nmap -sV -sC -T4 --top-ports 1000 {target}"
+        elif scan_type == "allports":
+            command = f"nmap -sV -sC -T4 -p- {target}"
+        else:
+            return
+
+        self.nmap_text.delete("1.0", tk.END)
+        self.nmap_text.insert(tk.END, command)
 
     def _browse_output_dir(self):
         """Browse for output directory."""
@@ -2700,15 +3985,15 @@ class SecurityOrchestratorGUI:
         if "Starting" in message:
             self.progress['value'] = 10
         elif "Nmap" in message and "completed" in message:
-            self.progress['value'] = 20
+            self.progress['value'] = 15
         elif "Exploit Database" in message and "completed" in message:
-            self.progress['value'] = 35
-        elif "Web Vulnerability" in message and "completed" in message:
-            self.progress['value'] = 50
+            self.progress['value'] = 30
         elif "SMB Enumeration" in message and "completed" in message:
-            self.progress['value'] = 70
+            self.progress['value'] = 45
         elif "Web Application" in message and "completed" in message:
-            self.progress['value'] = 85
+            self.progress['value'] = 60
+        elif "Nuclei" in message and "completed" in message:
+            self.progress['value'] = 80
         elif "Metasploit" in message and "completed" in message:
             self.progress['value'] = 100
 
@@ -2717,6 +4002,7 @@ class SecurityOrchestratorGUI:
         self.scan_running = False
         self.scan_button.config(state=tk.NORMAL)
         self.export_button.config(state=tk.NORMAL)
+        self.view_requests_button.config(state=tk.NORMAL)
 
         color = "green" if success else "red"
         self.status_label.config(text="Scan completed", foreground=color)
@@ -2760,6 +4046,288 @@ class SecurityOrchestratorGUI:
                 messagebox.showinfo("Success", f"Report exported to {save_path}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to export report: {e}")
+    def _view_captured_requests(self):
+        """Show captured HTTP request files."""
+        import os
+        request_dir = self.orchestrator.results_dir / "requests"
+
+        if request_dir.exists():
+            files = list(request_dir.glob("*.txt"))
+            if files:
+                # Show file list in new window
+                self._show_request_files_window(files)
+            else:
+                messagebox.showinfo("No Requests", "No HTTP request files captured yet.\nRun a scan first!")
+        else:
+            messagebox.showinfo("No Requests", "No HTTP request files captured yet.\nRun a scan first!")
+
+    def _show_request_files_window(self, files):
+        """Show a window with the list of captured request files."""
+        window = tk.Toplevel(self.root)
+        window.title("Captured HTTP Request Files")
+        window.geometry("600x400")
+
+        # Create text widget
+        text = scrolledtext.ScrolledText(window, wrap=tk.WORD)
+        text.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+
+        # Add file list
+        text.insert(tk.END, f"Found {len(files)} captured HTTP request files:\n\n")
+        for i, file in enumerate(sorted(files), 1):
+            text.insert(tk.END, f"{i}. {file.name}\n")
+            text.insert(tk.END, f"   Path: {file}\n")
+            try:
+                # Show first few lines of the request
+                with open(file, "r") as f:
+                    lines = f.readlines()[:5]  # First 5 lines
+                    for line in lines:
+                        text.insert(tk.END, f"   {line.rstrip()}\n")
+            except:
+                text.insert(tk.END, "   [Could not read file]\n")
+            text.insert(tk.END, "\n")
+
+        # Make text read-only
+        text.config(state=tk.DISABLED)
+
+        # Add close button
+        ttk.Button(window, text="Close", command=window.destroy).pack(pady=5)
+
+    # =========================================================================
+    # PENTEST AUTOMATION INTEGRATION METHODS
+    # =========================================================================
+
+    def _browse_auto_output(self):
+        """Browse for automated enumeration output directory"""
+        directory = filedialog.askdirectory()
+        if directory:
+            self.auto_output_entry.delete(0, tk.END)
+            self.auto_output_entry.insert(0, directory)
+
+    def _browse_osint_output(self):
+        """Browse for OSINT output directory"""
+        directory = filedialog.askdirectory()
+        if directory:
+            self.osint_output_entry.delete(0, tk.END)
+            self.osint_output_entry.insert(0, directory)
+
+    def _auto_log(self, message):
+        """Log message to automated enumeration console"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.auto_output_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.auto_output_text.see(tk.END)
+        self.status_bar.config(text=message[:100])
+
+    def _osint_log(self, message):
+        """Log message to OSINT console"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.osint_output_text.insert(tk.END, f"[{timestamp}] {message}\n")
+        self.osint_output_text.see(tk.END)
+        self.status_bar.config(text=message[:100])
+
+    def _start_auto_enum(self):
+        """Start automated enumeration scan"""
+        target = self.auto_target_entry.get().strip()
+        output_dir = self.auto_output_entry.get().strip()
+
+        if not target:
+            messagebox.showerror("Error", "Please enter a target IP or range")
+            return
+
+        if not output_dir:
+            messagebox.showerror("Error", "Please select an output directory")
+            return
+
+        # Get port scan type
+        port_scan_type = self.port_scan_type.get()
+
+        # Create enumerator with port scan type
+        self.auto_enumerator = AutomatedEnumerator(target, output_dir, port_scan_type)
+
+        # Update UI
+        self.auto_scan_button.config(state=tk.DISABLED)
+        self.auto_stop_button.config(state=tk.NORMAL)
+        self.auto_progress.start()
+
+        self.auto_output_text.delete('1.0', tk.END)
+        self._auto_log(f"Starting automated enumeration of {target}")
+        self._auto_log(f"Port scan mode: {'All 65535 ports' if port_scan_type == 'allports' else 'Top 1000 ports'}")
+        self._auto_log(f"Output directory: {self.auto_enumerator.folders['base']}")
+        self._auto_log("=" * 60)
+
+        # Run scan in separate thread
+        scan_thread = threading.Thread(target=self._run_auto_enum_thread, daemon=True)
+        scan_thread.start()
+
+    def _run_auto_enum_thread(self):
+        """Run automated enumeration in background thread"""
+        try:
+            # Phase 1: Nmap Discovery
+            if self.auto_tool_vars['nmap_discovery'].get():
+                self._auto_log("\n>>> Phase 1: Nmap Discovery")
+                self.auto_enumerator.run_nmap_discovery(callback=self._auto_log)
+
+            # Phase 2: Web Enumeration
+            if self.auto_tool_vars['web_enum'].get():
+                self._auto_log("\n>>> Phase 2: Web Enumeration")
+                self.auto_enumerator.run_web_enumeration(callback=self._auto_log)
+
+            # Phase 3: SMB Enumeration
+            if self.auto_tool_vars['smb_enum'].get():
+                self._auto_log("\n>>> Phase 3: SMB Enumeration")
+                self.auto_enumerator.run_smb_enumeration(callback=self._auto_log)
+
+            # Phase 4: Visual Reconnaissance
+            if self.auto_tool_vars['eyewitness'].get():
+                self._auto_log("\n>>> Phase 4: Visual Reconnaissance")
+                self.auto_enumerator.run_eyewitness(callback=self._auto_log)
+
+            # Generate summary
+            self.auto_enumerator._generate_summary_report()
+
+            self._auto_log("\n" + "=" * 60)
+            self._auto_log("✓ Enumeration completed successfully!")
+            self._auto_log(f"Results saved to: {self.auto_enumerator.folders['base']}")
+
+            # Store results
+            self.pentest_results['auto_enum'] = {
+                'target': self.auto_enumerator.target,
+                'output_dir': str(self.auto_enumerator.folders['base']),
+                'open_ports': self.auto_enumerator.open_ports if hasattr(self.auto_enumerator, 'open_ports') else {},
+                'results': self.auto_enumerator.results
+            }
+
+            # Show completion message
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Success",
+                f"Enumeration completed!\n\nResults saved to:\n{self.auto_enumerator.folders['base']}"
+            ))
+
+        except Exception as e:
+            self._auto_log(f"\n✗ Error during enumeration: {str(e)}")
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Enumeration failed:\n{str(e)}"))
+
+        finally:
+            # Re-enable buttons
+            self.root.after(0, lambda: self.auto_scan_button.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.auto_stop_button.config(state=tk.DISABLED))
+            self.root.after(0, lambda: self.auto_progress.stop())
+
+    def _stop_auto_enum(self):
+        """Stop automated enumeration"""
+        self._auto_log("\nStopping automated enumeration...")
+        self.auto_scan_button.config(state=tk.NORMAL)
+        self.auto_stop_button.config(state=tk.DISABLED)
+        self.auto_progress.stop()
+
+    def _start_osint(self):
+        """Start external OSINT enumeration"""
+        domain = self.osint_domain_entry.get().strip()
+        output_dir = self.osint_output_entry.get().strip()
+
+        if not domain:
+            messagebox.showerror("Error", "Please enter a target domain")
+            return
+
+        if not output_dir:
+            messagebox.showerror("Error", "Please select an output directory")
+            return
+
+        # Create enumerator
+        self.external_enumerator = ExternalEnumerator(domain, output_dir)
+
+        # Update UI
+        self.osint_scan_button.config(state=tk.DISABLED)
+        self.osint_stop_button.config(state=tk.NORMAL)
+        self.osint_progress.start()
+
+        self.osint_output_text.delete('1.0', tk.END)
+        self._osint_log(f"Starting external OSINT for {domain}")
+        self._osint_log(f"Output directory: {self.external_enumerator.folder}")
+        self._osint_log("=" * 60)
+
+        # Run scan in separate thread
+        scan_thread = threading.Thread(target=self._run_osint_thread, daemon=True)
+        scan_thread.start()
+
+    def _run_osint_thread(self):
+        """Run OSINT enumeration in background thread"""
+        try:
+            # Run selected tools
+            if self.osint_tool_vars['whois'].get():
+                self._osint_log("\n>>> Running WHOIS lookup")
+                self.external_enumerator.run_whois(callback=self._osint_log)
+
+            if self.osint_tool_vars['theharvester'].get():
+                self._osint_log("\n>>> Running theHarvester")
+                self.external_enumerator.run_theharvester(callback=self._osint_log)
+
+            if self.osint_tool_vars['dnsrecon'].get():
+                self._osint_log("\n>>> Running DNSRecon")
+                self.external_enumerator.run_dnsrecon(callback=self._osint_log)
+
+            if self.osint_tool_vars['sublist3r'].get():
+                self._osint_log("\n>>> Running Sublist3r")
+                self.external_enumerator.run_sublist3r(callback=self._osint_log)
+
+            # Generate summary
+            self.external_enumerator._generate_combined_report()
+
+            self._osint_log("\n" + "=" * 60)
+            self._osint_log("✓ OSINT enumeration completed!")
+            self._osint_log(f"Results saved to: {self.external_enumerator.folder}")
+
+            # Store results
+            self.pentest_results['osint'] = {
+                'domain': self.external_enumerator.domain,
+                'output_dir': str(self.external_enumerator.folder),
+                'results': self.external_enumerator.results
+            }
+
+            # Show completion message
+            self.root.after(0, lambda: messagebox.showinfo(
+                "Success",
+                f"OSINT enumeration completed!\n\nResults saved to:\n{self.external_enumerator.folder}"
+            ))
+
+        except Exception as e:
+            self._osint_log(f"\n✗ Error during OSINT: {str(e)}")
+            self.root.after(0, lambda: messagebox.showerror("Error", f"OSINT failed:\n{str(e)}"))
+
+        finally:
+            # Re-enable buttons
+            self.root.after(0, lambda: self.osint_scan_button.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.osint_stop_button.config(state=tk.DISABLED))
+            self.root.after(0, lambda: self.osint_progress.stop())
+
+    def _stop_osint(self):
+        """Stop OSINT enumeration"""
+        self._osint_log("\nStopping OSINT enumeration...")
+        self.osint_scan_button.config(state=tk.NORMAL)
+        self.osint_stop_button.config(state=tk.DISABLED)
+        self.osint_progress.stop()
+
+    def _process_pentest_queue(self):
+        """Process messages from pentest automation threads"""
+        try:
+            while True:
+                msg_type, msg_data = self.pentest_queue.get_nowait()
+
+                if msg_type == 'log':
+                    # Log to appropriate console
+                    pass
+                elif msg_type == 'complete':
+                    self.status_bar.config(text=f"Scan complete! Results: {msg_data}")
+                elif msg_type == 'error':
+                    self.status_bar.config(text=f"Error: {msg_data}")
+        except queue.Empty:
+            pass
+
+        # Schedule next check
+        self.root.after(100, self._process_pentest_queue)
+
+# =============================================================================
+# MAIN APPLICATION
+# =============================================================================
 
 # =============================================================================
 # MAIN APPLICATION
